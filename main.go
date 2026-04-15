@@ -257,5 +257,5 @@ func main() {
 	}
 	fmt.Println("}")
 
-	fmt.Printf("\nDone in: %v\n", time.Since(startTime))
+	fmt.Printf("\nProcessing time: %v\n", time.Since(startTime))
 }

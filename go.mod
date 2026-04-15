@@ -1,4 +1,4 @@
-module github.com/osmanyasin/one-brc-gopher
+module github.com/osmanyasin/brc-gopher
 
 go 1.26.2
 
