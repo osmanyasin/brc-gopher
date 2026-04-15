@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -17,11 +16,11 @@ const (
 )
 
 type Stats struct {
-	min, max, sum float64
+	min, max, sum int64
 	count         int64
 }
 
-func (s *Stats) update(temp float64) {
+func (s *Stats) update(temp int64) {
 	if temp < s.min {
 		s.min = temp
 	}
@@ -44,65 +43,59 @@ func (s *Stats) merge(other *Stats) {
 }
 
 func (s *Stats) mean() float64 {
-	return s.sum / float64(s.count)
+	return float64(s.sum) / float64(s.count) / 10.0
 }
 
-func parseTemp(raw []byte) (float64, error) {
-	raw = bytes.TrimSpace(raw)
-	if len(raw) == 0 {
-		return 0, io.EOF
-	}
+func (s *Stats) minF() float64 { return float64(s.min) / 10.0 }
+func (s *Stats) maxF() float64 { return float64(s.max) / 10.0 }
 
-	negative := raw[0] == '-'
+func parseTemp(data []byte, pos int) (int64, int) {
+	negative := data[pos] == '-'
 	if negative {
-		raw = raw[1:]
+		pos++
 	}
 
-	var integer, frac float64
-	var seenDot bool
-	var fracPlace float64 = 0.1
-
-	for _, c := range raw {
-		switch {
-		case c == '.':
-			seenDot = true
-		case c >= '0' && c <= '9':
-			digit := float64(c - '0')
-			if seenDot {
-				frac += digit * fracPlace
-				fracPlace *= 0.1
-			} else {
-				integer = integer*10 + digit
-			}
+	var temp int64
+	for pos < len(data) {
+		c := data[pos]
+		pos++
+		if c == '\n' {
+			break
+		}
+		if c != '.' && c != '\r' {
+			temp = temp*10 + int64(c-'0')
 		}
 	}
 
-	result := integer + frac
 	if negative {
-		result = -result
+		return -temp, pos
 	}
-	return result, nil
+	return temp, pos
 }
 
 func processChunk(data []byte) map[string]*Stats {
 	results := make(map[string]*Stats)
+	pos := 0
 
-	for _, line := range bytes.Split(data, []byte("\n")) {
-		line = bytes.TrimSpace(line)
-		if len(line) == 0 {
-			continue
+	for pos < len(data) {
+		start := pos
+
+		for pos < len(data) && data[pos] != ';' {
+			pos++
+		}
+		if pos >= len(data) {
+			break
 		}
 
-		sepIdx := bytes.IndexByte(line, ';')
-		if sepIdx == -1 {
-			continue
+		station := string(data[start:pos])
+		pos++ // skip ';'
+
+		if pos >= len(data) {
+			break
 		}
 
-		station := string(line[:sepIdx])
-		temp, err := parseTemp(line[sepIdx+1:])
-		if err != nil {
-			continue
-		}
+		temp, nextPos := parseTemp(data, pos)
+		pos = nextPos
 
 		if stats, exists := results[station]; exists {
 			stats.update(temp)
@@ -110,6 +103,7 @@ func processChunk(data []byte) map[string]*Stats {
 			results[station] = &Stats{min: temp, max: temp, sum: temp, count: 1}
 		}
 	}
+
 	return results
 }
 
@@ -234,7 +228,7 @@ func main() {
 			fmt.Print(", ")
 		}
 		res := finalResults[s]
-		fmt.Printf("%s=%.1f/%.1f/%.1f", s, res.min, res.mean(), res.max)
+		fmt.Printf("%s=%.1f/%.1f/%.1f", s, res.minF(), res.mean(), res.maxF())
 	}
 	fmt.Println("}")
 	fmt.Printf("Elapsed: %s\n", time.Since(start))
