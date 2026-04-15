@@ -2,18 +2,17 @@ package main
 
 import (
 	"fmt"
-	"io"
 	"os"
 	"runtime"
 	"sort"
 	"sync"
 	"time"
+	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
-const (
-	smallFileThreshold = 1024 * 1024
-	maxLineLength      = 1024
-)
+const smallFileThreshold = 1024 * 1024
 
 type Stats struct {
 	min, max, sum int64
@@ -42,10 +41,7 @@ func (s *Stats) merge(other *Stats) {
 	s.count += other.count
 }
 
-func (s *Stats) mean() float64 {
-	return float64(s.sum) / float64(s.count) / 10.0
-}
-
+func (s *Stats) mean() float64 { return float64(s.sum) / float64(s.count) / 10.0 }
 func (s *Stats) minF() float64 { return float64(s.min) / 10.0 }
 func (s *Stats) maxF() float64 { return float64(s.max) / 10.0 }
 
@@ -79,7 +75,6 @@ func processChunk(data []byte) map[string]*Stats {
 
 	for pos < len(data) {
 		start := pos
-
 		for pos < len(data) && data[pos] != ';' {
 			pos++
 		}
@@ -88,7 +83,7 @@ func processChunk(data []byte) map[string]*Stats {
 		}
 
 		station := string(data[start:pos])
-		pos++ // skip ';'
+		pos++
 
 		if pos >= len(data) {
 			break
@@ -107,53 +102,61 @@ func processChunk(data []byte) map[string]*Stats {
 	return results
 }
 
-func readChunk(filename string, workerID, numWorkers int, fileSize, chunkSize int64) map[string]*Stats {
-	f, _ := os.Open(filename)
-	defer f.Close()
-
-	start := int64(workerID) * chunkSize
-	end := start + chunkSize
-	if workerID == numWorkers-1 {
-		end = fileSize
+func mmapFile(filename string) ([]byte, func(), error) {
+	f, err := os.Open(filename)
+	if err != nil {
+		return nil, nil, err
 	}
 
-	if start > 0 {
-		f.Seek(start-1, 0)
-		buf := make([]byte, 1)
-		for {
-			_, err := f.Read(buf)
-			if err != nil || buf[0] == '\n' {
-				break
-			}
-			start++
-		}
+	fi, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, nil, err
+	}
+	size := fi.Size()
+
+	handle, err := windows.CreateFileMapping(
+		windows.Handle(f.Fd()),
+		nil,
+		windows.PAGE_READONLY,
+		0, 0,
+		nil,
+	)
+	if err != nil {
+		f.Close()
+		return nil, nil, fmt.Errorf("CreateFileMapping: %w", err)
 	}
 
-	f.Seek(start, 0)
-	length := end - start
-	if length <= 0 && workerID != 0 {
-		return nil
+	addr, err := windows.MapViewOfFile(
+		handle,
+		windows.FILE_MAP_READ,
+		0, 0,
+		uintptr(size),
+	)
+	if err != nil {
+		windows.CloseHandle(handle)
+		f.Close()
+		return nil, nil, fmt.Errorf("MapViewOfFile: %w", err)
 	}
 
-	data := make([]byte, length+maxLineLength)
-	n, _ := io.ReadFull(f, data)
-	data = data[:n]
+	data := unsafe.Slice((*byte)(unsafe.Pointer(addr)), size)
 
-	if end < fileSize {
-		extra := make([]byte, 1)
-		for {
-			_, err := f.Read(extra)
-			if err != nil {
-				break
-			}
-			data = append(data, extra[0])
-			if extra[0] == '\n' {
-				break
-			}
-		}
+	cleanup := func() {
+		windows.UnmapViewOfFile(addr)
+		windows.CloseHandle(handle)
+		f.Close()
 	}
+	return data, cleanup, nil
+}
 
-	return processChunk(data)
+func findChunkBoundary(data []byte, pos int) int {
+	for pos < len(data) && data[pos] != '\n' {
+		pos++
+	}
+	if pos < len(data) {
+		pos++
+	}
+	return pos
 }
 
 func mergeResults(dst, src map[string]*Stats) {
@@ -172,38 +175,46 @@ func main() {
 		return
 	}
 
-	filename := os.Args[1]
-	file, err := os.Open(filename)
+	data, cleanup, err := mmapFile(os.Args[1])
 	if err != nil {
-		fmt.Printf("Error opening file: %v\n", err)
+		fmt.Printf("Error mapping file: %v\n", err)
 		return
 	}
-	defer file.Close()
+	defer cleanup()
 
-	fi, _ := file.Stat()
-	fileSize := fi.Size()
+	fileSize := len(data)
 	if fileSize == 0 {
 		fmt.Println("{}")
 		return
 	}
 
-	start := time.Now()
+	startTime := time.Now()
 
 	numWorkers := runtime.NumCPU()
 	if fileSize < smallFileThreshold {
 		numWorkers = 1
 	}
 
-	chunkSize := fileSize / int64(numWorkers)
+	chunkSize := fileSize / numWorkers
 	resultsChan := make(chan map[string]*Stats, numWorkers)
 	var wg sync.WaitGroup
 
+	start := 0
 	for i := 0; i < numWorkers; i++ {
+		end := start + chunkSize
+		if i == numWorkers-1 {
+			end = fileSize
+		} else {
+			end = findChunkBoundary(data, end)
+		}
+
 		wg.Add(1)
-		go func(workerID int) {
+		go func(chunk []byte) {
 			defer wg.Done()
-			resultsChan <- readChunk(filename, workerID, numWorkers, fileSize, chunkSize)
-		}(i)
+			resultsChan <- processChunk(chunk)
+		}(data[start:end])
+
+		start = end
 	}
 
 	go func() {
@@ -231,5 +242,5 @@ func main() {
 		fmt.Printf("%s=%.1f/%.1f/%.1f", s, res.minF(), res.mean(), res.maxF())
 	}
 	fmt.Println("}")
-	fmt.Printf("Elapsed: %s\n", time.Since(start))
+	fmt.Printf("Elapsed: %s\n", time.Since(startTime))
 }
