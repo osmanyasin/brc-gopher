@@ -235,8 +235,7 @@ func main() {
 					existing.sum += t.entries[i].sum
 					existing.count += t.entries[i].count
 				} else {
-					s := t.entries[i]
-					finalMap[nameStr] = &s
+					finalMap[nameStr] = new(t.entries[i])
 				}
 			}
 		}
