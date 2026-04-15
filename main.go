@@ -8,6 +8,12 @@ import (
 	"runtime"
 	"sort"
 	"sync"
+	"time"
+)
+
+const (
+	smallFileThreshold = 1024 * 1024
+	maxLineLength      = 1024
 )
 
 type Stats struct {
@@ -37,40 +43,41 @@ func (s *Stats) merge(other *Stats) {
 	s.count += other.count
 }
 
-// parseFloat ignores '\r' and whitespace to handle all line endings
-func parseFloat(b []byte) (float64, error) {
-	b = bytes.TrimSpace(b) // Remove \r, \n, and spaces
-	if len(b) == 0 {
+func (s *Stats) mean() float64 {
+	return s.sum / float64(s.count)
+}
+
+func parseTemp(raw []byte) (float64, error) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 {
 		return 0, io.EOF
 	}
 
-	negative := false
-	if b[0] == '-' {
-		negative = true
-		b = b[1:]
+	negative := raw[0] == '-'
+	if negative {
+		raw = raw[1:]
 	}
 
-	var result float64
-	var decimal bool
-	var decimalPlace float64 = 0.1
+	var integer, frac float64
+	var seenDot bool
+	var fracPlace float64 = 0.1
 
-	for _, c := range b {
-		if c == '.' {
-			decimal = true
-			continue
-		}
-		if c < '0' || c > '9' {
-			continue
-		} // Skip non-numeric chars like \r
-
-		digit := float64(c - '0')
-		if decimal {
-			result += digit * decimalPlace
-			decimalPlace *= 0.1
-		} else {
-			result = result*10 + digit
+	for _, c := range raw {
+		switch {
+		case c == '.':
+			seenDot = true
+		case c >= '0' && c <= '9':
+			digit := float64(c - '0')
+			if seenDot {
+				frac += digit * fracPlace
+				fracPlace *= 0.1
+			} else {
+				integer = integer*10 + digit
+			}
 		}
 	}
+
+	result := integer + frac
 	if negative {
 		result = -result
 	}
@@ -79,9 +86,8 @@ func parseFloat(b []byte) (float64, error) {
 
 func processChunk(data []byte) map[string]*Stats {
 	results := make(map[string]*Stats)
-	lines := bytes.Split(data, []byte("\n"))
 
-	for _, line := range lines {
+	for _, line := range bytes.Split(data, []byte("\n")) {
 		line = bytes.TrimSpace(line)
 		if len(line) == 0 {
 			continue
@@ -93,7 +99,7 @@ func processChunk(data []byte) map[string]*Stats {
 		}
 
 		station := string(line[:sepIdx])
-		temp, err := parseFloat(line[sepIdx+1:])
+		temp, err := parseTemp(line[sepIdx+1:])
 		if err != nil {
 			continue
 		}
@@ -105,6 +111,65 @@ func processChunk(data []byte) map[string]*Stats {
 		}
 	}
 	return results
+}
+
+func readChunk(filename string, workerID, numWorkers int, fileSize, chunkSize int64) map[string]*Stats {
+	f, _ := os.Open(filename)
+	defer f.Close()
+
+	start := int64(workerID) * chunkSize
+	end := start + chunkSize
+	if workerID == numWorkers-1 {
+		end = fileSize
+	}
+
+	if start > 0 {
+		f.Seek(start-1, 0)
+		buf := make([]byte, 1)
+		for {
+			_, err := f.Read(buf)
+			if err != nil || buf[0] == '\n' {
+				break
+			}
+			start++
+		}
+	}
+
+	f.Seek(start, 0)
+	length := end - start
+	if length <= 0 && workerID != 0 {
+		return nil
+	}
+
+	data := make([]byte, length+maxLineLength)
+	n, _ := io.ReadFull(f, data)
+	data = data[:n]
+
+	if end < fileSize {
+		extra := make([]byte, 1)
+		for {
+			_, err := f.Read(extra)
+			if err != nil {
+				break
+			}
+			data = append(data, extra[0])
+			if extra[0] == '\n' {
+				break
+			}
+		}
+	}
+
+	return processChunk(data)
+}
+
+func mergeResults(dst, src map[string]*Stats) {
+	for station, stats := range src {
+		if existing, exists := dst[station]; exists {
+			existing.merge(stats)
+		} else {
+			dst[station] = stats
+		}
+	}
 }
 
 func main() {
@@ -128,9 +193,10 @@ func main() {
 		return
 	}
 
+	start := time.Now()
+
 	numWorkers := runtime.NumCPU()
-	// For very small files, just use 1 worker
-	if fileSize < 1024*1024 {
+	if fileSize < smallFileThreshold {
 		numWorkers = 1
 	}
 
@@ -142,59 +208,7 @@ func main() {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-
-			f, _ := os.Open(filename)
-			defer f.Close()
-
-			start := int64(workerID) * chunkSize
-			end := start + chunkSize
-			if workerID == numWorkers-1 {
-				end = fileSize
-			}
-
-			// 1. Align: If not at start, move to the first byte after the next '\n'
-			if start > 0 {
-				f.Seek(start-1, 0)
-				b := make([]byte, 1)
-				for {
-					_, err := f.Read(b)
-					if err != nil || b[0] == '\n' {
-						break
-					}
-					start++
-				}
-			}
-
-			// 2. Read until the end of this worker's chunk
-			// AND continue until the very next newline to finish the line
-			f.Seek(start, 0)
-			length := end - start
-			if length <= 0 && workerID != 0 {
-				return
-			}
-
-			// Buffer to hold our chunk + a little extra for the rest of the last line
-			data := make([]byte, length+1024)
-			n, _ := io.ReadFull(f, data)
-			data = data[:n]
-
-			// If we aren't at the end of the file, we might have a partial line
-			// Read until we hit a newline
-			if end < fileSize {
-				extra := make([]byte, 1)
-				for {
-					_, err := f.Read(extra)
-					if err != nil {
-						break
-					}
-					data = append(data, extra[0])
-					if extra[0] == '\n' {
-						break
-					}
-				}
-			}
-
-			resultsChan <- processChunk(data)
+			resultsChan <- readChunk(filename, workerID, numWorkers, fileSize, chunkSize)
 		}(i)
 	}
 
@@ -205,13 +219,7 @@ func main() {
 
 	finalResults := make(map[string]*Stats)
 	for chunkResults := range resultsChan {
-		for station, stats := range chunkResults {
-			if existing, exists := finalResults[station]; exists {
-				existing.merge(stats)
-			} else {
-				finalResults[station] = stats
-			}
-		}
+		mergeResults(finalResults, chunkResults)
 	}
 
 	stations := make([]string, 0, len(finalResults))
@@ -222,11 +230,12 @@ func main() {
 
 	fmt.Print("{")
 	for i, s := range stations {
-		res := finalResults[s]
 		if i > 0 {
 			fmt.Print(", ")
 		}
-		fmt.Printf("%s=%.1f/%.1f/%.1f", s, res.min, res.sum/float64(res.count), res.max)
+		res := finalResults[s]
+		fmt.Printf("%s=%.1f/%.1f/%.1f", s, res.min, res.mean(), res.max)
 	}
 	fmt.Println("}")
+	fmt.Printf("Elapsed: %s\n", time.Since(start))
 }
