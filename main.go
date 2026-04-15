@@ -12,94 +12,123 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-const smallFileThreshold = 1024 * 1024
+const (
+	tableSize = 1 << 14
+	tableMask = tableSize - 1
+)
 
 type Stats struct {
 	min, max, sum int64
 	count         int64
+	name          []byte
 }
 
-func (s *Stats) update(temp int64) {
-	if temp < s.min {
-		s.min = temp
-	}
-	if temp > s.max {
-		s.max = temp
-	}
-	s.sum += temp
-	s.count++
+type Table struct {
+	entries []Stats
+	used    []bool
 }
 
-func (s *Stats) merge(other *Stats) {
-	if other.min < s.min {
-		s.min = other.min
+func newTable() *Table {
+	return &Table{
+		entries: make([]Stats, tableSize),
+		used:    make([]bool, tableSize),
 	}
-	if other.max > s.max {
-		s.max = other.max
-	}
-	s.sum += other.sum
-	s.count += other.count
 }
 
-func (s *Stats) mean() float64 { return float64(s.sum) / float64(s.count) / 10.0 }
-func (s *Stats) minF() float64 { return float64(s.min) / 10.0 }
-func (s *Stats) maxF() float64 { return float64(s.max) / 10.0 }
+func hashBytes(b []byte) uint64 {
+	var h uint64 = 14695981039346656037
+	for _, c := range b {
+		h ^= uint64(c)
+		h *= 1099511628211
+	}
+	return h
+}
 
-func parseTemp(data []byte, pos int) (int64, int) {
-	negative := data[pos] == '-'
-	if negative {
+func (t *Table) getOrCreate(name []byte) *Stats {
+	h := hashBytes(name)
+	idx := h & tableMask
+
+	for t.used[idx] {
+		if len(t.entries[idx].name) == len(name) {
+			match := true
+			for i := range name {
+				if t.entries[idx].name[i] != name[i] {
+					match = false
+					break
+				}
+			}
+			if match {
+				return &t.entries[idx]
+			}
+		}
+		idx = (idx + 1) & tableMask
+	}
+
+	t.used[idx] = true
+	t.entries[idx] = Stats{
+		name: name,
+		min:  1000,
+		max:  -1000,
+	}
+	return &t.entries[idx]
+}
+
+func parseTempFast(data []byte, pos int) (int64, int) {
+	neg := false
+	if data[pos] == '-' {
+		neg = true
 		pos++
 	}
 
-	var temp int64
-	for pos < len(data) {
+	var val int64
+	for {
 		c := data[pos]
 		pos++
+		if c == '.' {
+			continue
+		}
 		if c == '\n' {
 			break
 		}
-		if c != '.' && c != '\r' {
-			temp = temp*10 + int64(c-'0')
+		if c == '\r' {
+			continue
 		}
+		val = val*10 + int64(c-'0')
 	}
 
-	if negative {
-		return -temp, pos
+	if neg {
+		return -val, pos
 	}
-	return temp, pos
+	return val, pos
 }
 
-func processChunk(data []byte) map[string]*Stats {
-	results := make(map[string]*Stats)
+func processChunk(data []byte) *Table {
+	table := newTable()
 	pos := 0
+	limit := len(data)
 
-	for pos < len(data) {
+	for pos < limit {
 		start := pos
-		for pos < len(data) && data[pos] != ';' {
+		for data[pos] != ';' {
 			pos++
 		}
-		if pos >= len(data) {
-			break
-		}
-
-		station := string(data[start:pos])
+		stationName := data[start:pos]
 		pos++
 
-		if pos >= len(data) {
-			break
-		}
-
-		temp, nextPos := parseTemp(data, pos)
+		temp, nextPos := parseTempFast(data, pos)
 		pos = nextPos
 
-		if stats, exists := results[station]; exists {
-			stats.update(temp)
-		} else {
-			results[station] = &Stats{min: temp, max: temp, sum: temp, count: 1}
+		s := table.getOrCreate(stationName)
+		if temp < s.min {
+			s.min = temp
 		}
+		if temp > s.max {
+			s.max = temp
+		}
+		s.sum += temp
+		s.count++
 	}
-
-	return results
+	return table
 }
 
 func mmapFile(filename string) ([]byte, func(), error) {
@@ -124,19 +153,14 @@ func mmapFile(filename string) ([]byte, func(), error) {
 	)
 	if err != nil {
 		f.Close()
-		return nil, nil, fmt.Errorf("CreateFileMapping: %w", err)
+		return nil, nil, err
 	}
 
-	addr, err := windows.MapViewOfFile(
-		handle,
-		windows.FILE_MAP_READ,
-		0, 0,
-		uintptr(size),
-	)
+	addr, err := windows.MapViewOfFile(handle, windows.FILE_MAP_READ, 0, 0, uintptr(size))
 	if err != nil {
 		windows.CloseHandle(handle)
 		f.Close()
-		return nil, nil, fmt.Errorf("MapViewOfFile: %w", err)
+		return nil, nil, err
 	}
 
 	data := unsafe.Slice((*byte)(unsafe.Pointer(addr)), size)
@@ -159,88 +183,80 @@ func findChunkBoundary(data []byte, pos int) int {
 	return pos
 }
 
-func mergeResults(dst, src map[string]*Stats) {
-	for station, stats := range src {
-		if existing, exists := dst[station]; exists {
-			existing.merge(stats)
-		} else {
-			dst[station] = stats
-		}
-	}
-}
-
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("Usage: go run main.go <file>")
+		fmt.Println("Usage: go run main.go <measurements_file>")
 		return
 	}
 
 	data, cleanup, err := mmapFile(os.Args[1])
 	if err != nil {
-		fmt.Printf("Error mapping file: %v\n", err)
-		return
+		panic(err)
 	}
 	defer cleanup()
 
-	fileSize := len(data)
-	if fileSize == 0 {
-		fmt.Println("{}")
-		return
-	}
-
 	startTime := time.Now()
+	numWorkers := runtime.GOMAXPROCS(0)
+	chunkSize := len(data) / numWorkers
 
-	numWorkers := runtime.NumCPU()
-	if fileSize < smallFileThreshold {
-		numWorkers = 1
-	}
-
-	chunkSize := fileSize / numWorkers
-	resultsChan := make(chan map[string]*Stats, numWorkers)
 	var wg sync.WaitGroup
+	results := make([]*Table, numWorkers)
 
 	start := 0
 	for i := 0; i < numWorkers; i++ {
 		end := start + chunkSize
 		if i == numWorkers-1 {
-			end = fileSize
+			end = len(data)
 		} else {
 			end = findChunkBoundary(data, end)
 		}
 
 		wg.Add(1)
-		go func(chunk []byte) {
+		go func(idx int, chunk []byte) {
 			defer wg.Done()
-			resultsChan <- processChunk(chunk)
-		}(data[start:end])
-
+			results[idx] = processChunk(chunk)
+		}(i, data[start:end])
 		start = end
 	}
+	wg.Wait()
 
-	go func() {
-		wg.Wait()
-		close(resultsChan)
-	}()
-
-	finalResults := make(map[string]*Stats)
-	for chunkResults := range resultsChan {
-		mergeResults(finalResults, chunkResults)
+	finalMap := make(map[string]*Stats)
+	for _, t := range results {
+		for i := 0; i < tableSize; i++ {
+			if t.used[i] {
+				nameStr := string(t.entries[i].name)
+				if existing, ok := finalMap[nameStr]; ok {
+					if t.entries[i].min < existing.min {
+						existing.min = t.entries[i].min
+					}
+					if t.entries[i].max > existing.max {
+						existing.max = t.entries[i].max
+					}
+					existing.sum += t.entries[i].sum
+					existing.count += t.entries[i].count
+				} else {
+					s := t.entries[i]
+					finalMap[nameStr] = &s
+				}
+			}
+		}
 	}
 
-	stations := make([]string, 0, len(finalResults))
-	for s := range finalResults {
+	stations := make([]string, 0, len(finalMap))
+	for s := range finalMap {
 		stations = append(stations, s)
 	}
 	sort.Strings(stations)
 
 	fmt.Print("{")
-	for i, s := range stations {
+	for i, name := range stations {
+		s := finalMap[name]
 		if i > 0 {
 			fmt.Print(", ")
 		}
-		res := finalResults[s]
-		fmt.Printf("%s=%.1f/%.1f/%.1f", s, res.minF(), res.mean(), res.maxF())
+		fmt.Printf("%s=%.1f/%.1f/%.1f", name, float64(s.min)/10.0, (float64(s.sum)/float64(s.count))/10.0, float64(s.max)/10.0)
 	}
 	fmt.Println("}")
-	fmt.Printf("Elapsed: %s\n", time.Since(startTime))
+
+	fmt.Printf("\nDone in: %v\n", time.Since(startTime))
 }
